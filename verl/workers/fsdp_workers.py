@@ -29,6 +29,7 @@ import torch.distributed as dist
 from codetiming import Timer
 from omegaconf import DictConfig, OmegaConf, open_dict
 from peft import LoraConfig, TaskType, get_peft_model
+from peft.tuners.lora.layer import LoraLayer
 from safetensors.torch import save_file
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -244,11 +245,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             else:
                 self.tokenizer.chat_template = self.config.model.custom_chat_template
 
-        torch_dtype = fsdp_config.get("model_dtype", None)
-        if torch_dtype is None:
-            torch_dtype = torch.float32 if self._is_actor else torch.bfloat16
-        else:
-            torch_dtype = PrecisionType.to_dtype(torch_dtype)
+        # torch_dtype = fsdp_config.get("model_dtype", None)
+        # if torch_dtype is None:
+        #     torch_dtype = torch.float32 if self._is_actor else torch.bfloat16
+        # else:
+        #     torch_dtype = PrecisionType.to_dtype(torch_dtype)
+        torch_dtype = torch.bfloat16
 
         # override model kwargs
         actor_model_config = AutoConfig.from_pretrained(
@@ -327,6 +329,16 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                     "bias": "none",
                 }
                 actor_module = get_peft_model(actor_module, LoraConfig(**lora_config))
+
+                for name, module in actor_module.named_modules():
+                    if isinstance(module, LoraLayer) and "q_proj" in name:
+                        for key in module.lora_A.keys():
+                            with torch.no_grad():
+                                module.lora_A[key].weight.zero_()
+                                module.lora_B[key].weight.zero_()
+                        with open("verl_log.txt", "a") as f:
+                            f.write(f"Zeroed A/B weights in: {name}\n")
+
         torch.distributed.barrier()
 
         if self.rank == 0:
@@ -447,6 +459,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                     min_lr_ratio=min_lr_ratio,
                     num_cycles=num_cycles,
                 )
+            elif warmup_style == None:
+                actor_lr_scheduler = None
             else:
                 raise NotImplementedError(f"Warmup style {warmup_style} is not supported")
 

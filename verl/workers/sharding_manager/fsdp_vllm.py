@@ -283,12 +283,14 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         model = self.model_runner.model
         if peft_config:
             if self.base_sync_done:
+                peft_dict = asdict(peft_config)
+                peft_dict["r"] = 8
                 lora_int_id = int(time.time_ns() % 0x7FFFFFFF)
                 lora_reqest = TensorLoRARequest(
                     lora_name=f"{lora_int_id}",
                     lora_int_id=lora_int_id,
                     lora_path="simon_lora_path",
-                    peft_config=asdict(peft_config),
+                    peft_config=peft_dict,
                     lora_tensors=updated_params,
                 )
                 self.inference_engine.llm_engine.add_lora(lora_reqest)
