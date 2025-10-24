@@ -39,16 +39,35 @@ __all__ = ["HFRollout"]
 class HFRollout(BaseRollout):
     def __init__(self, module: nn.Module, config):
         super().__init__()
+        print("Starting HFRollout")
         self.config = config
         self.module = module
 
     def generate_sequences(self, prompts: DataProto) -> DataProto:
         batch_size = prompts.batch.batch_size[0]
-        num_chunks = max(batch_size // self.config.get("micro_batch_size", batch_size), 1)
+        # Support multiple knobs for generation micro-batching
+        mb = (
+            self.config.get("micro_batch_size", None)
+            or self.config.get("micro_batch_size_per_gpu", None)
+            or self.config.get("log_prob_micro_batch_size", None)
+        )
+        if mb is None:
+            mb = batch_size
+        num_chunks = max(batch_size // mb, 1)
         batch_prompts = prompts.chunk(chunks=num_chunks)
-        output = [self._generate_minibatch(p) for p in batch_prompts]
-        output = DataProto.concat(output)
-        return output
+        output_chunks = []
+        for p in batch_prompts:
+            # If guidance is provided per-sample via non_tensor_batch and this micro-batch has size 1,
+            # copy the IDs into meta_info so the inner loop can access them reliably.
+            try:
+                if p.batch is not None and p.batch.batch_size[0] == 1:
+                    gai = p.non_tensor_batch.get("guided_answer_ids", None)
+                    if gai is not None and len(gai) > 0 and gai[0] is not None:
+                        p.meta_info["guided_answer_ids"] = gai[0]
+            except Exception:
+                pass
+            output_chunks.append(self._generate_minibatch(p))
+        return DataProto.concat(output_chunks)
 
     @torch.no_grad()
     def _generate_minibatch(self, prompts: DataProto) -> DataProto:
@@ -85,7 +104,8 @@ class HFRollout(BaseRollout):
                 "top_p": top_p,
                 "top_k": top_k,
                 "temperature": temperature,
-                "num_return_sequences": self.config.n,
+                # Trainer already repeats the batch by rollout.n. Avoid double-multiplying memory.
+                "num_return_sequences": 1,
             }
 
         # make config according to generate mode
@@ -107,22 +127,129 @@ class HFRollout(BaseRollout):
             # recurse need to set to False according to https://github.com/pytorch/pytorch/issues/100069
             param_ctx = FSDP.summon_full_params(self.module, writeback=False, recurse=False)
         with param_ctx, torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
-            output = self.module.generate(
-                input_ids=idx,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                do_sample=do_sample,
-                max_new_tokens=response_length,
-                eos_token_id=eos_token_id,
-                pad_token_id=pad_token_id,
-                generation_config=generation_config,
-                output_scores=False,  # this is potentially very large
-                return_dict_in_generate=True,
-                use_cache=True,
-            )
+            guided_answer_ids = prompts.meta_info.get("guided_answer_ids", None)
+            # Fallback: batched per-sample guidance passed via non_tensor_batch as object array
+            if guided_answer_ids is None:
+                gai = prompts.non_tensor_batch.get("guided_answer_ids", None)
+                if gai is not None and len(gai) > 0 and prompts.batch.batch_size[0] == 1:
+                    guided_answer_ids = gai[0]
+            guided_tau = prompts.meta_info.get("guided_tau", 0.01)
+            use_guidance = guided_answer_ids is not None and guided_tau is not None
+            if use_guidance and idx.size(0) == 1 and kwargs.get("num_return_sequences", 1) == 1:
+                print("Guiding:")
+                print(guided_answer_ids)
+                print(guided_tau)
+
+                input_ids = idx
+                am = attention_mask
+                pos = position_ids
+                guided_ptr = 0
+                guidance_failed = 0
+                started_guidance = False
+                start_snapshot = None
+                max_steps = response_length
+                eos_list = eos_token_id if isinstance(eos_token_id, (list, tuple)) else [eos_token_id]
+                for step in range(max_steps):
+                    out = self.module(input_ids=input_ids, attention_mask=am, position_ids=pos, use_cache=False)
+                    logits = out.logits[:, -1, :]
+                    logits_float = logits.float()
+                    probs_full = torch.softmax(logits_float, dim=-1)
+
+                    attempt_guidance = True
+
+                    if attempt_guidance:
+                        if not started_guidance:
+                            started_guidance = True
+                            start_snapshot = (input_ids, am, pos)
+                        target_token = guided_answer_ids[guided_ptr]
+                        if probs_full[0, target_token] >= guided_tau:
+                            next_token = torch.tensor([[target_token]], device=input_ids.device, dtype=input_ids.dtype)
+                            guided_ptr += 1
+                        else:
+                            guidance_failed += 1
+                            guided_ptr = 0
+                            input_ids, am, pos = start_snapshot
+                            out = self.module(input_ids=input_ids, attention_mask=am, position_ids=pos, use_cache=False)
+                            logits = out.logits[:, -1, :]
+                            logits_float = logits.float()
+                            if not do_sample:
+                                next_token = torch.argmax(logits_float, dim=-1, keepdim=True)
+                            else:
+                                l = logits_float
+                                if temperature is not None and temperature != 1.0:
+                                    l = l / max(temperature, 1e-8)
+                                if top_k is not None and top_k > 0:
+                                    topk_vals, topk_idx = torch.topk(l, k=min(top_k, l.size(-1)), dim=-1)
+                                    l_masked = torch.full_like(l, float("-inf"))
+                                    l_masked.scatter_(dim=-1, index=topk_idx, src=topk_vals)
+                                    l = l_masked
+                                if top_p is not None and 0.0 < top_p < 1.0:
+                                    sorted_logits, sorted_idx = torch.sort(l, descending=True, dim=-1)
+                                    sorted_probs = torch.softmax(sorted_logits, dim=-1)
+                                    cumprobs = torch.cumsum(sorted_probs, dim=-1)
+                                    keep = cumprobs <= top_p
+                                    keep[..., :1] = True
+                                    sorted_logits = torch.where(
+                                        keep, sorted_logits, torch.full_like(sorted_logits, float("-inf"))
+                                    )
+                                    l = torch.full_like(l, float("-inf"))
+                                    l.scatter_(dim=-1, index=sorted_idx, src=sorted_logits)
+                                probs = torch.softmax(l, dim=-1)
+                                next_token = torch.multinomial(probs, num_samples=1)
+                    else:
+                        if not do_sample:
+                            next_token = torch.argmax(logits_float, dim=-1, keepdim=True)
+                        else:
+                            l = logits_float
+                            if temperature is not None and temperature != 1.0:
+                                l = l / max(temperature, 1e-8)
+                            if top_k is not None and top_k > 0:
+                                topk_vals, topk_idx = torch.topk(l, k=min(top_k, l.size(-1)), dim=-1)
+                                l_masked = torch.full_like(l, float("-inf"))
+                                l_masked.scatter_(dim=-1, index=topk_idx, src=topk_vals)
+                                l = l_masked
+                            if top_p is not None and 0.0 < top_p < 1.0:
+                                sorted_logits, sorted_idx = torch.sort(l, descending=True, dim=-1)
+                                sorted_probs = torch.softmax(sorted_logits, dim=-1)
+                                cumprobs = torch.cumsum(sorted_probs, dim=-1)
+                                keep = cumprobs <= top_p
+                                keep[..., :1] = True
+                                sorted_logits = torch.where(
+                                    keep, sorted_logits, torch.full_like(sorted_logits, float("-inf"))
+                                )
+                                l = torch.full_like(l, float("-inf"))
+                                l.scatter_(dim=-1, index=sorted_idx, src=sorted_logits)
+                            probs = torch.softmax(l, dim=-1)
+                            next_token = torch.multinomial(probs, num_samples=1)
+
+                    input_ids = torch.cat((input_ids, next_token), dim=1)
+                    am = torch.cat((am, torch.ones((am.size(0), 1), dtype=am.dtype, device=am.device)), dim=1)
+                    pos = torch.cat((pos, pos[:, -1:] + 1), dim=1)
+
+                    if next_token[0, 0].item() in eos_list:
+                        break
+                    if started_guidance and guided_ptr == len(guided_answer_ids):
+                        print('Answer Guidance Succeeded!!')
+                        break
+
+                seq = input_ids
+            else:
+                output = self.module.generate(
+                    input_ids=idx,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    do_sample=do_sample,
+                    max_new_tokens=response_length,
+                    eos_token_id=eos_token_id,
+                    pad_token_id=pad_token_id,
+                    generation_config=generation_config,
+                    output_scores=False,  # this is potentially very large
+                    return_dict_in_generate=True,
+                    use_cache=True,
+                )
+                seq = output.sequences
 
         # TODO: filter out the seq with no answers like ds-chat
-        seq = output.sequences
         generated_batch_size = seq.size(0)  # bs * num_return_sequences
 
         # huggingface generate will stop generating when all the batch reaches [EOS].

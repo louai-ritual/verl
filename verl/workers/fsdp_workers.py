@@ -743,6 +743,44 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             else self.tokenizer.pad_token_id,
         }
         prompts.meta_info.update(meta_info)
+        # Ensure guided_answer_ids is available for single-sample micro-batches
+        try:
+            if (
+                "guided_answer_ids" not in prompts.meta_info
+                and prompts.batch is not None
+                and prompts.batch.batch_size[0] == 1
+            ):
+                # 1) Prefer IDs passed from trainer via non_tensor_batch
+                gai = prompts.non_tensor_batch.get("guided_answer_ids", None)
+                if gai is not None and len(gai) > 0 and gai[0] is not None:
+                    prompts.meta_info["guided_answer_ids"] = gai[0]
+                # 2) Fallback to computing from reward_model.ground_truth
+                elif "reward_model" in prompts.non_tensor_batch:
+                    rm_entry = prompts.non_tensor_batch["reward_model"][0]
+                    gt = None
+                    if isinstance(rm_entry, dict):
+                        gt = rm_entry.get("ground_truth", None)
+                    elif isinstance(rm_entry, str):
+                        try:
+                            import json
+
+                            obj = json.loads(rm_entry)
+                            if isinstance(obj, dict):
+                                gt = obj.get("ground_truth", None)
+                        except Exception:
+                            gt = None
+                    elif hasattr(rm_entry, "item"):
+                        try:
+                            obj = rm_entry.item()
+                            if isinstance(obj, dict):
+                                gt = obj.get("ground_truth", None)
+                        except Exception:
+                            gt = None
+                    if isinstance(gt, str) and len(gt) > 0:
+                        guided_ids = self.tokenizer.encode(gt, add_special_tokens=False)
+                        prompts.meta_info["guided_answer_ids"] = guided_ids
+        except Exception:
+            pass
         timing_generate = {}
         with self.rollout_sharding_manager:
             log_gpu_memory_usage("After entering rollout sharding manager", logger=logger)
