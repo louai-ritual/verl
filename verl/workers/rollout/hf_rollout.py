@@ -21,6 +21,7 @@ to perform generation.
 import contextlib
 
 import torch
+import numpy as np
 import torch.distributed
 from tensordict import TensorDict
 from torch import nn
@@ -118,7 +119,7 @@ class HFRollout(BaseRollout):
 
         # used to construct attention_mask
         eos_token_id = prompts.meta_info["eos_token_id"]
-        pad_token_id = prompts.meta_info["pad_token_id"]
+        pad_token_id = prompts.meta_info["pad_token_id"] or 151643
 
         self.module.eval()
         param_ctx = contextlib.nullcontext()
@@ -143,84 +144,81 @@ class HFRollout(BaseRollout):
                 input_ids = idx
                 am = attention_mask
                 pos = position_ids
-                guided_ptr = 0
-                guidance_failed = 0
-                started_guidance = False
-                start_snapshot = None
                 max_steps = response_length
                 eos_list = eos_token_id if isinstance(eos_token_id, (list, tuple)) else [eos_token_id]
+                gai = guided_answer_ids
+                if isinstance(gai, torch.Tensor):
+                    gai_list = gai.view(-1).tolist()
+                elif isinstance(gai, np.ndarray):
+                    if getattr(gai, "dtype", None) == object:
+                        gai_list = [int(x) for x in gai.flatten().tolist() if x is not None]
+                    else:
+                        gai_list = gai.astype(np.int64).flatten().tolist()
+                elif isinstance(gai, (list, tuple)):
+                    stack = [gai]
+                    gai_list = []
+                    while stack:
+                        e = stack.pop()
+                        if isinstance(e, (list, tuple)):
+                            stack.extend(list(e))
+                        else:
+                            if e is not None:
+                                gai_list.append(int(e))
+                else:
+                    gai_list = [int(gai)]
+                answer_tensor = torch.tensor(gai_list, device=idx.device, dtype=idx.dtype).view(1, -1)
+                answer_len = answer_tensor.size(1)
                 for step in range(max_steps):
                     out = self.module(input_ids=input_ids, attention_mask=am, position_ids=pos, use_cache=False)
                     logits = out.logits[:, -1, :]
                     logits_float = logits.float()
-                    probs_full = torch.softmax(logits_float, dim=-1)
-
                     attempt_guidance = True
-
+                    
                     if attempt_guidance:
-                        if not started_guidance:
-                            started_guidance = True
-                            start_snapshot = (input_ids, am, pos)
-                        target_token = guided_answer_ids[guided_ptr]
-                        if probs_full[0, target_token] >= guided_tau:
-                            next_token = torch.tensor([[target_token]], device=input_ids.device, dtype=input_ids.dtype)
-                            guided_ptr += 1
-                        else:
-                            guidance_failed += 1
-                            guided_ptr = 0
-                            input_ids, am, pos = start_snapshot
-                            out = self.module(input_ids=input_ids, attention_mask=am, position_ids=pos, use_cache=False)
-                            logits = out.logits[:, -1, :]
-                            logits_float = logits.float()
-                            if not do_sample:
-                                next_token = torch.argmax(logits_float, dim=-1, keepdim=True)
-                            else:
-                                l = logits_float
-                                if temperature is not None and temperature != 1.0:
-                                    l = l / max(temperature, 1e-8)
-                                if top_k is not None and top_k > 0:
-                                    topk_vals, topk_idx = torch.topk(l, k=min(top_k, l.size(-1)), dim=-1)
-                                    l_masked = torch.full_like(l, float("-inf"))
-                                    l_masked.scatter_(dim=-1, index=topk_idx, src=topk_vals)
-                                    l = l_masked
-                                if top_p is not None and 0.0 < top_p < 1.0:
-                                    sorted_logits, sorted_idx = torch.sort(l, descending=True, dim=-1)
-                                    sorted_probs = torch.softmax(sorted_logits, dim=-1)
-                                    cumprobs = torch.cumsum(sorted_probs, dim=-1)
-                                    keep = cumprobs <= top_p
-                                    keep[..., :1] = True
-                                    sorted_logits = torch.where(
-                                        keep, sorted_logits, torch.full_like(sorted_logits, float("-inf"))
-                                    )
-                                    l = torch.full_like(l, float("-inf"))
-                                    l.scatter_(dim=-1, index=sorted_idx, src=sorted_logits)
-                                probs = torch.softmax(l, dim=-1)
-                                next_token = torch.multinomial(probs, num_samples=1)
+                        remain = response_length - (input_ids.size(1) - prompt_length)
+                        if answer_len + 1 <= remain:
+                            pos_ext = pos[:, -1:] + torch.arange(1, answer_len + 1, device=pos.device).unsqueeze(0)
+                            am_ext = torch.ones((am.size(0), answer_len), dtype=am.dtype, device=am.device)
+                            input_ids_full = torch.cat((input_ids, answer_tensor), dim=1)
+                            pos_full = torch.cat((pos, pos_ext), dim=1)
+                            am_full = torch.cat((am, am_ext), dim=1)
+                            out_full = self.module(input_ids=input_ids_full, attention_mask=am_full, position_ids=pos_full, use_cache=False)
+                            lp_full = torch.log_softmax(out_full.logits.float(), dim=-1)
+                            start_idx = input_ids.size(1) - 1
+                            slice_lp = lp_full[0, start_idx:start_idx + answer_len, :]
+                            sel_lp = slice_lp.gather(dim=-1, index=answer_tensor[0].unsqueeze(1)).squeeze(1)
+                            avg_log_p = sel_lp.mean()
+                            p_avg = torch.exp(avg_log_p)
+                            if p_avg.item() >= guided_tau:
+                                eos_id = eos_list[0]
+                                eos_tok = torch.tensor([[eos_id]], device=input_ids.device, dtype=input_ids.dtype)
+                                input_ids = torch.cat((input_ids, answer_tensor, eos_tok), dim=1)
+                                am = torch.cat((am, am_ext, torch.ones((am.size(0), 1), dtype=am.dtype, device=am.device)), dim=1)
+                                pos = torch.cat((pos, pos_ext, pos_ext[:, -1:] + 1), dim=1)
+                                print('Answer Guidance Succeeded!!')
+                                break
+                    if not do_sample:
+                        next_token = torch.argmax(logits_float, dim=-1, keepdim=True)
                     else:
-                        if not do_sample:
-                            next_token = torch.argmax(logits_float, dim=-1, keepdim=True)
-                        else:
-                            l = logits_float
-                            if temperature is not None and temperature != 1.0:
-                                l = l / max(temperature, 1e-8)
-                            if top_k is not None and top_k > 0:
-                                topk_vals, topk_idx = torch.topk(l, k=min(top_k, l.size(-1)), dim=-1)
-                                l_masked = torch.full_like(l, float("-inf"))
-                                l_masked.scatter_(dim=-1, index=topk_idx, src=topk_vals)
-                                l = l_masked
-                            if top_p is not None and 0.0 < top_p < 1.0:
-                                sorted_logits, sorted_idx = torch.sort(l, descending=True, dim=-1)
-                                sorted_probs = torch.softmax(sorted_logits, dim=-1)
-                                cumprobs = torch.cumsum(sorted_probs, dim=-1)
-                                keep = cumprobs <= top_p
-                                keep[..., :1] = True
-                                sorted_logits = torch.where(
-                                    keep, sorted_logits, torch.full_like(sorted_logits, float("-inf"))
-                                )
-                                l = torch.full_like(l, float("-inf"))
-                                l.scatter_(dim=-1, index=sorted_idx, src=sorted_logits)
-                            probs = torch.softmax(l, dim=-1)
-                            next_token = torch.multinomial(probs, num_samples=1)
+                        l = logits_float
+                        if temperature is not None and temperature != 1.0:
+                            l = l / max(temperature, 1e-8)
+                        if top_k is not None and top_k > 0:
+                            topk_vals, topk_idx = torch.topk(l, k=min(top_k, l.size(-1)), dim=-1)
+                            l_masked = torch.full_like(l, float("-inf"))
+                            l_masked.scatter_(dim=-1, index=topk_idx, src=topk_vals)
+                            l = l_masked
+                        if top_p is not None and 0.0 < top_p < 1.0:
+                            sorted_logits, sorted_idx = torch.sort(l, descending=True, dim=-1)
+                            sorted_probs = torch.softmax(sorted_logits, dim=-1)
+                            cumprobs = torch.cumsum(sorted_probs, dim=-1)
+                            keep = cumprobs <= top_p
+                            keep[..., :1] = True
+                            sorted_logits = torch.where(keep, sorted_logits, torch.full_like(sorted_logits, float("-inf")))
+                            l = torch.full_like(l, float("-inf"))
+                            l.scatter_(dim=-1, index=sorted_idx, src=sorted_logits)
+                        probs = torch.softmax(l, dim=-1)
+                        next_token = torch.multinomial(probs, num_samples=1)
 
                     input_ids = torch.cat((input_ids, next_token), dim=1)
                     am = torch.cat((am, torch.ones((am.size(0), 1), dtype=am.dtype, device=am.device)), dim=1)
@@ -228,10 +226,7 @@ class HFRollout(BaseRollout):
 
                     if next_token[0, 0].item() in eos_list:
                         break
-                    if started_guidance and guided_ptr == len(guided_answer_ids):
-                        print('Answer Guidance Succeeded!!')
-                        break
-
+                
                 seq = input_ids
             else:
                 output = self.module.generate(
