@@ -26,7 +26,7 @@ import torch.distributed
 from tensordict import TensorDict
 from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from transformers import GenerationConfig
+from transformers import GenerationConfig, AutoTokenizer
 
 from verl import DataProto
 from verl.utils.device import get_device_name, get_torch_device
@@ -43,6 +43,7 @@ class HFRollout(BaseRollout):
         print("Starting HFRollout")
         self.config = config
         self.module = module
+        self._tokenizer = None
 
     def generate_sequences(self, prompts: DataProto) -> DataProto:
         batch_size = prompts.batch.batch_size[0]
@@ -146,6 +147,14 @@ class HFRollout(BaseRollout):
                 pos = position_ids
                 max_steps = response_length
                 eos_list = eos_token_id if isinstance(eos_token_id, (list, tuple)) else [eos_token_id]
+                # helper to flatten nested containers in-order
+                def _flatten_in_order(x, out):
+                    if isinstance(x, (list, tuple, np.ndarray)):
+                        for el in x:
+                            _flatten_in_order(el, out)
+                    else:
+                        if x is not None:
+                            out.append(int(x))
                 gai = guided_answer_ids
                 if isinstance(gai, torch.Tensor):
                     gai_list = gai.view(-1).tolist()
@@ -155,19 +164,50 @@ class HFRollout(BaseRollout):
                     else:
                         gai_list = gai.astype(np.int64).flatten().tolist()
                 elif isinstance(gai, (list, tuple)):
-                    stack = [gai]
                     gai_list = []
-                    while stack:
-                        e = stack.pop()
-                        if isinstance(e, (list, tuple)):
-                            stack.extend(list(e))
-                        else:
-                            if e is not None:
-                                gai_list.append(int(e))
+                    _flatten_in_order(gai, gai_list)
                 else:
                     gai_list = [int(gai)]
                 answer_tensor = torch.tensor(gai_list, device=idx.device, dtype=idx.dtype).view(1, -1)
                 answer_len = answer_tensor.size(1)
+                # Optional wrappers for reward formatting (e.g., \\boxed{ ... })
+                def _get_ids_from_meta(key):
+                    v = prompts.meta_info.get(key, None)
+                    if v is None:
+                        nt = prompts.non_tensor_batch.get(key, None)
+                        if nt is not None and len(nt) > 0 and prompts.batch.batch_size[0] == 1:
+                            v = nt[0]
+                    if v is None:
+                        return []
+                    if isinstance(v, torch.Tensor):
+                        return [int(x) for x in v.view(-1).tolist()]
+                    if isinstance(v, np.ndarray):
+                        if getattr(v, "dtype", None) == object:
+                            return [int(x) for x in v.flatten().tolist() if x is not None]
+                        return [int(x) for x in v.astype(np.int64).flatten().tolist()]
+                    if isinstance(v, (list, tuple)):
+                        temp = []
+                        _flatten_in_order(v, temp)
+                        return temp
+                    return [int(v)]
+
+                prefix_ids = _get_ids_from_meta("guided_prefix_ids")
+                suffix_ids = _get_ids_from_meta("guided_suffix_ids")
+                if len(prefix_ids) == 0 and len(suffix_ids) == 0:
+                    try:
+                        if self._tokenizer is None:
+                            name_or_path = getattr(self.module.config, "_name_or_path", None) or getattr(self.module.config, "name_or_path", None)
+                            if name_or_path is not None:
+                                self._tokenizer = AutoTokenizer.from_pretrained(name_or_path, trust_remote_code=True)
+                        if self._tokenizer is not None:
+                            prefix_ids = self._tokenizer.encode("\\boxed{", add_special_tokens=False)
+                            suffix_ids = self._tokenizer.encode("}", add_special_tokens=False)
+                    except Exception:
+                        pass
+                prefix_tensor = torch.tensor(prefix_ids, device=idx.device, dtype=idx.dtype).view(1, -1) if len(prefix_ids) > 0 else None
+                suffix_tensor = torch.tensor(suffix_ids, device=idx.device, dtype=idx.dtype).view(1, -1) if len(suffix_ids) > 0 else None
+                prefix_len = prefix_tensor.size(1) if prefix_tensor is not None else 0
+                suffix_len = suffix_tensor.size(1) if suffix_tensor is not None else 0
                 # Maintain a single active KV cache across steps
                 pkv = None
                 # First step consumes the full prompt to build cache; subsequent steps feed only the last sampled token
@@ -181,9 +221,10 @@ class HFRollout(BaseRollout):
                             use_cache=True,
                         )
                     else:
+                        step_am = torch.ones((am.size(0), step_input_ids.size(1)), dtype=am.dtype, device=am.device)
                         out = self.module(
                             input_ids=step_input_ids,
-                            attention_mask=None,
+                            attention_mask=step_am,
                             position_ids=pos[:, -1:],
                             past_key_values=pkv,
                             use_cache=True,
@@ -191,40 +232,95 @@ class HFRollout(BaseRollout):
                     pkv = getattr(out, "past_key_values", None)
                     logits_float = out.logits[:, -1, :].float()
 
-                    # Try guidance by forwarding only the answer tokens with the current cache
+                    # Try guidance by forwarding optional prefix + answer (+ suffix only for cache commit) with current cache
                     remain = response_length - (input_ids.size(1) - prompt_length)
-                    if answer_len + 1 <= remain:
-                        pos_ext = pos[:, -1:] + torch.arange(1, answer_len + 1, device=pos.device).unsqueeze(0)
-                        am_ext = torch.ones((am.size(0), answer_len), dtype=am.dtype, device=am.device)
+                    need = prefix_len + answer_len + suffix_len + 1  # include EOS
+                    if need <= remain:
+                        # Optional prefix
+                        pkv_for_ans = pkv
+                        if prefix_len > 0:
+                            pos_pref = pos[:, -1:] + torch.arange(1, prefix_len + 1, device=pos.device).unsqueeze(0)
+                            pref_am = torch.ones((am.size(0), prefix_len), dtype=am.dtype, device=am.device)
+                            out_pref = self.module(
+                                input_ids=prefix_tensor,
+                                attention_mask=pref_am,
+                                position_ids=pos_pref,
+                                past_key_values=pkv_for_ans,
+                                use_cache=True,
+                            )
+                            pkv_for_ans = getattr(out_pref, "past_key_values", pkv_for_ans)
+                        else:
+                            pos_pref = None
+
+                        # Answer scoring
+                        pos_ans = (pos_pref if prefix_len > 0 else pos)[:, -1:] + torch.arange(1, answer_len + 1, device=pos.device).unsqueeze(0)
+                        ans_am = torch.ones((am.size(0), answer_len), dtype=am.dtype, device=am.device)
                         out_ans = self.module(
                             input_ids=answer_tensor,
-                            attention_mask=None,
-                            position_ids=pos_ext,
-                            past_key_values=pkv,
+                            attention_mask=ans_am,
+                            position_ids=pos_ans,
+                            past_key_values=pkv_for_ans,
                             use_cache=True,
                         )
                         lp_ans = torch.log_softmax(out_ans.logits.float(), dim=-1)
-                        # Gather per-token log-prob for the guided sequence
                         sel_lp = lp_ans[0].gather(dim=-1, index=answer_tensor[0].unsqueeze(1)).squeeze(1)
                         avg_log_p = sel_lp.mean()
                         p_avg = torch.exp(avg_log_p)
                         if p_avg.item() >= guided_tau:
-                            # Accept guidance: commit cache, append answer and EOS, then terminate
-                            pkv = getattr(out_ans, "past_key_values", pkv)
+                            # Accept guidance: commit cache and append prefix/answer/suffix/EOS
+                            pkv_commit = getattr(out_ans, "past_key_values", pkv_for_ans)
+                            # Optional suffix
+                            if suffix_len > 0:
+                                pos_suf = pos_ans[:, -1:] + torch.arange(1, suffix_len + 1, device=pos.device).unsqueeze(0)
+                                suf_am = torch.ones((am.size(0), suffix_len), dtype=am.dtype, device=am.device)
+                                out_suf = self.module(
+                                    input_ids=suffix_tensor,
+                                    attention_mask=suf_am,
+                                    position_ids=pos_suf,
+                                    past_key_values=pkv_commit,
+                                    use_cache=True,
+                                )
+                                pkv_commit = getattr(out_suf, "past_key_values", pkv_commit)
+                            else:
+                                pos_suf = None
+
+                            # EOS
+                            last_pos_for_eos = (pos_suf if suffix_len > 0 else pos_ans)
+                            pos_eos = last_pos_for_eos[:, -1:] + 1
                             eos_id = eos_list[0]
                             eos_tok = torch.tensor([[eos_id]], device=input_ids.device, dtype=input_ids.dtype)
-                            pos_eos = pos_ext[:, -1:] + 1
+                            eos_am = torch.ones((am.size(0), 1), dtype=am.dtype, device=am.device)
                             out_eos = self.module(
                                 input_ids=eos_tok,
-                                attention_mask=None,
+                                attention_mask=eos_am,
                                 position_ids=pos_eos,
-                                past_key_values=pkv,
+                                past_key_values=pkv_commit,
                                 use_cache=True,
                             )
-                            pkv = getattr(out_eos, "past_key_values", pkv)
-                            input_ids = torch.cat((input_ids, answer_tensor, eos_tok), dim=1)
-                            am = torch.cat((am, am_ext, torch.ones((am.size(0), 1), dtype=am.dtype, device=am.device)), dim=1)
-                            pos = torch.cat((pos, pos_ext, pos_eos), dim=1)
+                            pkv = getattr(out_eos, "past_key_values", pkv_commit)
+
+                            # Commit tensors to sequence in correct order
+                            parts_ids = []
+                            parts_pos = []
+                            parts_am = []
+                            if prefix_len > 0:
+                                parts_ids.append(prefix_tensor)
+                                parts_pos.append(pos_pref)
+                                parts_am.append(torch.ones((am.size(0), prefix_len), dtype=am.dtype, device=am.device))
+                            parts_ids.append(answer_tensor)
+                            parts_pos.append(pos_ans)
+                            parts_am.append(torch.ones((am.size(0), answer_len), dtype=am.dtype, device=am.device))
+                            if suffix_len > 0:
+                                parts_ids.append(suffix_tensor)
+                                parts_pos.append(pos_suf)
+                                parts_am.append(torch.ones((am.size(0), suffix_len), dtype=am.dtype, device=am.device))
+                            parts_ids.append(eos_tok)
+                            parts_pos.append(pos_eos)
+                            parts_am.append(torch.ones((am.size(0), 1), dtype=am.dtype, device=am.device))
+
+                            input_ids = torch.cat([input_ids] + parts_ids, dim=1)
+                            pos = torch.cat([pos] + parts_pos, dim=1)
+                            am = torch.cat([am] + parts_am, dim=1)
                             print('Answer Guidance Succeeded!!')
                             break
 
