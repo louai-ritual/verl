@@ -168,35 +168,66 @@ class HFRollout(BaseRollout):
                     gai_list = [int(gai)]
                 answer_tensor = torch.tensor(gai_list, device=idx.device, dtype=idx.dtype).view(1, -1)
                 answer_len = answer_tensor.size(1)
+                # Maintain a single active KV cache across steps
+                pkv = None
+                # First step consumes the full prompt to build cache; subsequent steps feed only the last sampled token
+                step_input_ids = input_ids
                 for step in range(max_steps):
-                    out = self.module(input_ids=input_ids, attention_mask=am, position_ids=pos, use_cache=False)
-                    logits = out.logits[:, -1, :]
-                    logits_float = logits.float()
-                    attempt_guidance = True
-                    
-                    if attempt_guidance:
-                        remain = response_length - (input_ids.size(1) - prompt_length)
-                        if answer_len + 1 <= remain:
-                            pos_ext = pos[:, -1:] + torch.arange(1, answer_len + 1, device=pos.device).unsqueeze(0)
-                            am_ext = torch.ones((am.size(0), answer_len), dtype=am.dtype, device=am.device)
-                            input_ids_full = torch.cat((input_ids, answer_tensor), dim=1)
-                            pos_full = torch.cat((pos, pos_ext), dim=1)
-                            am_full = torch.cat((am, am_ext), dim=1)
-                            out_full = self.module(input_ids=input_ids_full, attention_mask=am_full, position_ids=pos_full, use_cache=False)
-                            lp_full = torch.log_softmax(out_full.logits.float(), dim=-1)
-                            start_idx = input_ids.size(1) - 1
-                            slice_lp = lp_full[0, start_idx:start_idx + answer_len, :]
-                            sel_lp = slice_lp.gather(dim=-1, index=answer_tensor[0].unsqueeze(1)).squeeze(1)
-                            avg_log_p = sel_lp.mean()
-                            p_avg = torch.exp(avg_log_p)
-                            if p_avg.item() >= guided_tau:
-                                eos_id = eos_list[0]
-                                eos_tok = torch.tensor([[eos_id]], device=input_ids.device, dtype=input_ids.dtype)
-                                input_ids = torch.cat((input_ids, answer_tensor, eos_tok), dim=1)
-                                am = torch.cat((am, am_ext, torch.ones((am.size(0), 1), dtype=am.dtype, device=am.device)), dim=1)
-                                pos = torch.cat((pos, pos_ext, pos_ext[:, -1:] + 1), dim=1)
-                                print('Answer Guidance Succeeded!!')
-                                break
+                    if pkv is None:
+                        out = self.module(
+                            input_ids=step_input_ids,
+                            attention_mask=am,
+                            position_ids=pos,
+                            use_cache=True,
+                        )
+                    else:
+                        out = self.module(
+                            input_ids=step_input_ids,
+                            attention_mask=None,
+                            position_ids=pos[:, -1:],
+                            past_key_values=pkv,
+                            use_cache=True,
+                        )
+                    pkv = getattr(out, "past_key_values", None)
+                    logits_float = out.logits[:, -1, :].float()
+
+                    # Try guidance by forwarding only the answer tokens with the current cache
+                    remain = response_length - (input_ids.size(1) - prompt_length)
+                    if answer_len + 1 <= remain:
+                        pos_ext = pos[:, -1:] + torch.arange(1, answer_len + 1, device=pos.device).unsqueeze(0)
+                        am_ext = torch.ones((am.size(0), answer_len), dtype=am.dtype, device=am.device)
+                        out_ans = self.module(
+                            input_ids=answer_tensor,
+                            attention_mask=None,
+                            position_ids=pos_ext,
+                            past_key_values=pkv,
+                            use_cache=True,
+                        )
+                        lp_ans = torch.log_softmax(out_ans.logits.float(), dim=-1)
+                        # Gather per-token log-prob for the guided sequence
+                        sel_lp = lp_ans[0].gather(dim=-1, index=answer_tensor[0].unsqueeze(1)).squeeze(1)
+                        avg_log_p = sel_lp.mean()
+                        p_avg = torch.exp(avg_log_p)
+                        if p_avg.item() >= guided_tau:
+                            # Accept guidance: commit cache, append answer and EOS, then terminate
+                            pkv = getattr(out_ans, "past_key_values", pkv)
+                            eos_id = eos_list[0]
+                            eos_tok = torch.tensor([[eos_id]], device=input_ids.device, dtype=input_ids.dtype)
+                            pos_eos = pos_ext[:, -1:] + 1
+                            out_eos = self.module(
+                                input_ids=eos_tok,
+                                attention_mask=None,
+                                position_ids=pos_eos,
+                                past_key_values=pkv,
+                                use_cache=True,
+                            )
+                            pkv = getattr(out_eos, "past_key_values", pkv)
+                            input_ids = torch.cat((input_ids, answer_tensor, eos_tok), dim=1)
+                            am = torch.cat((am, am_ext, torch.ones((am.size(0), 1), dtype=am.dtype, device=am.device)), dim=1)
+                            pos = torch.cat((pos, pos_ext, pos_eos), dim=1)
+                            print('Answer Guidance Succeeded!!')
+                            break
+
                     if not do_sample:
                         next_token = torch.argmax(logits_float, dim=-1, keepdim=True)
                     else:
@@ -226,6 +257,8 @@ class HFRollout(BaseRollout):
 
                     if next_token[0, 0].item() in eos_list:
                         break
+                    # Next step consumes only the newly added token
+                    step_input_ids = next_token
                 
                 seq = input_ids
             else:
