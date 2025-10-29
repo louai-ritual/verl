@@ -710,7 +710,7 @@ class RayPPOTrainer:
                         if gt is not None and not isinstance(gt, str):
                             gt = str(gt)
                         if isinstance(gt, str) and len(gt) > 0:
-                            guided_ids.append(self.tokenizer.encode(gt, add_special_tokens=False))
+                            guided_ids.append(self.tokenizer.encode(f"\\boxed{{{gt}}}", add_special_tokens=False))
                         else:
                             guided_ids.append(None)
                     test_gen_batch.non_tensor_batch["guided_answer_ids"] = np.array(guided_ids, dtype=object)
