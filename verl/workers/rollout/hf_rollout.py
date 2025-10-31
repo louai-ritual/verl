@@ -132,7 +132,7 @@ class HFRollout(BaseRollout):
                 gai = prompts.non_tensor_batch.get("guided_answer_ids", None)
                 if gai is not None and len(gai) > 0 and prompts.batch.batch_size[0] == 1:
                     guided_answer_ids = gai[0]
-            guided_tau = prompts.meta_info.get("guided_tau", 0.01)
+            guided_tau = prompts.meta_info.get("guided_tau", 1e-8)
 
             use_guidance = guided_answer_ids is not None
             if use_guidance:
@@ -176,10 +176,11 @@ class HFRollout(BaseRollout):
                         current_completion_ids = torch.cat([current_completion_ids, new_token.unsqueeze(0)], dim=1)
                         
                     if new_token == eos_token_id or step == response_length - 1:
+                        # print("Guided answer rejected with probability:", answer_probability)
                         seq = torch.cat([base_prompt_ids, current_completion_ids], dim=1)
-                        print(seq.shape)
-                        print(seq)
                         break
+                # print(seq.shape)
+                # print(seq)
             else:
                 output = self.module.generate(
                     input_ids=idx,
