@@ -679,63 +679,6 @@ class RayPPOTrainer:
             }
             print(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
 
-            if "reward_model" in test_batch.non_tensor_batch:
-                test_gen_batch.non_tensor_batch["reward_model"] = test_batch.non_tensor_batch["reward_model"]
-                try:
-                    import json
-
-                    rm_arr = test_gen_batch.non_tensor_batch["reward_model"]
-                    guided_ids = []
-                    for i in range(len(rm_arr)):
-                        rm_entry = rm_arr[i]
-                        gt = None
-                        if isinstance(rm_entry, dict):
-                            gt = rm_entry.get("ground_truth", None)
-                        elif isinstance(rm_entry, str):
-                            try:
-                                obj = json.loads(rm_entry)
-                                if isinstance(obj, dict):
-                                    gt = obj.get("ground_truth", None)
-                            except Exception:
-                                gt = None
-                        # sometimes rm_entry could be numpy.object_ holding a dict
-                        elif hasattr(rm_entry, "item"):
-                            try:
-                                obj = rm_entry.item()
-                                if isinstance(obj, dict):
-                                    gt = obj.get("ground_truth", None)
-                            except Exception:
-                                gt = None
-
-                        if gt is not None and not isinstance(gt, str):
-                            gt = str(gt)
-                        if isinstance(gt, str) and len(gt) > 0:
-                            guided_ids.append(self.tokenizer.encode(f"\\boxed{{{gt}}}", add_special_tokens=False))
-                        else:
-                            guided_ids.append(None)
-                    test_gen_batch.non_tensor_batch["guided_answer_ids"] = np.array(guided_ids, dtype=object)
-                    # If single-sample, also set into meta_info for robust access in HF rollout
-                    if len(test_gen_batch) == 1 and guided_ids[0] is not None:
-                        test_gen_batch.meta_info["guided_answer_ids"] = guided_ids[0]
-                    # Also add a padded tensor variant into batch for robust transport
-                    max_len = max((len(x) for x in guided_ids if x is not None), default=0)
-                    if max_len > 0:
-                        pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
-                        padded = torch.full((len(guided_ids), max_len), pad_id, dtype=torch.long)
-                        lens = torch.zeros(len(guided_ids), dtype=torch.long)
-                        for i, ids in enumerate(guided_ids):
-                            if ids is not None and len(ids) > 0:
-                                l = len(ids)
-                                padded[i, :l] = torch.tensor(ids, dtype=torch.long)
-                                lens[i] = l
-                        # Ensure batch exists then attach
-                        if test_gen_batch.batch is None:
-                            test_gen_batch.batch = TensorDict({}, batch_size=(len(guided_ids),))
-                        test_gen_batch.batch["guided_answer_ids_padded"] = padded
-                        test_gen_batch.batch["guided_answer_lens"] = lens
-                except Exception:
-                    pass
-
             # pad to be divisible by dp_size
             size_divisor = (
                 self.actor_rollout_wg.world_size
@@ -1194,7 +1137,7 @@ class RayPPOTrainer:
                             if gt is not None and not isinstance(gt, str):
                                 gt = str(gt)
                             if isinstance(gt, str) and len(gt) > 0:
-                                guided_ids.append(self.tokenizer.encode(gt, add_special_tokens=False))
+                                guided_ids.append(self.tokenizer.encode(f"\\boxed{{{gt}}}", add_special_tokens=False))
                             else:
                                 guided_ids.append(None)
                         gen_batch.non_tensor_batch["guided_answer_ids"] = np.array(guided_ids, dtype=object)

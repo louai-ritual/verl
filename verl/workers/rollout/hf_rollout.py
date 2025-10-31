@@ -19,14 +19,13 @@ to perform generation.
 """
 
 import contextlib
-
-import torch
 import numpy as np
+import torch
 import torch.distributed
 from tensordict import TensorDict
 from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from transformers import GenerationConfig
+from transformers import GenerationConfig, DynamicCache
 
 from verl import DataProto
 from verl.utils.device import get_device_name, get_torch_device
@@ -105,7 +104,6 @@ class HFRollout(BaseRollout):
                 "top_p": top_p,
                 "top_k": top_k,
                 "temperature": temperature,
-                # Trainer already repeats the batch by rollout.n. Avoid double-multiplying memory.
                 "num_return_sequences": 1,
             }
 
@@ -135,127 +133,61 @@ class HFRollout(BaseRollout):
                 if gai is not None and len(gai) > 0 and prompts.batch.batch_size[0] == 1:
                     guided_answer_ids = gai[0]
             guided_tau = prompts.meta_info.get("guided_tau", 0.01)
-            use_guidance = guided_answer_ids is not None and guided_tau is not None
-            if use_guidance and idx.size(0) == 1 and kwargs.get("num_return_sequences", 1) == 1:
+
+            use_guidance = guided_answer_ids is not None
+            if use_guidance:
+                if isinstance(guided_answer_ids, list):
+                    guided_answer_ids = torch.tensor([guided_answer_ids], dtype=torch.int32, device=idx.device)
+                else:
+                    guided_answer_ids = torch.tensor([guided_answer_ids.astype(np.int32)], dtype=torch.int32, device=idx.device)
                 print("Guiding:")
                 print(guided_answer_ids)
-                print(guided_tau)
 
-                input_ids = idx
-                am = attention_mask
-                pos = position_ids
-                max_steps = response_length
-                eos_list = eos_token_id if isinstance(eos_token_id, (list, tuple)) else [eos_token_id]
-                # helper to flatten nested containers in-order
-                def _flatten_in_order(x, out):
-                    if isinstance(x, (list, tuple, np.ndarray)):
-                        for el in x:
-                            _flatten_in_order(el, out)
-                    else:
-                        if x is not None:
-                            out.append(int(x))
-                gai = guided_answer_ids
-                if isinstance(gai, torch.Tensor):
-                    gai_list = gai.view(-1).tolist()
-                elif isinstance(gai, np.ndarray):
-                    if getattr(gai, "dtype", None) == object:
-                        gai_list = [int(x) for x in gai.flatten().tolist() if x is not None]
-                    else:
-                        gai_list = gai.astype(np.int64).flatten().tolist()
-                elif isinstance(gai, (list, tuple)):
-                    gai_list = []
-                    _flatten_in_order(gai, gai_list)
-                else:
-                    gai_list = [int(gai)]
-                answer_tensor = torch.tensor(gai_list, device=idx.device, dtype=idx.dtype).view(1, -1)
-                answer_len = answer_tensor.size(1)
-                # No wrapper handling here; trainer is responsible for formatting guided_answer_ids
-                # Maintain a single active KV cache across steps
-                pkv = None
-                # First step consumes the full prompt to build cache; subsequent steps feed only the last sampled token
-                step_input_ids = input_ids
-                for step in range(max_steps):
-                    if pkv is None:
-                        out = self.module(
-                            input_ids=step_input_ids,
-                            attention_mask=am,
-                            position_ids=pos,
-                            use_cache=True,
-                        )
-                    else:
-                        step_am = torch.ones((am.size(0), step_input_ids.size(1)), dtype=am.dtype, device=am.device)
-                        out = self.module(
-                            input_ids=step_input_ids,
-                            attention_mask=step_am,
-                            position_ids=pos[:, -1:],
-                            past_key_values=pkv,
-                            use_cache=True,
-                        )
-                    pkv = getattr(out, "past_key_values", None)
-                    logits_float = out.logits[:, -1, :].float()
+                base_prompt_ids = idx[:, :prompt_length]
+                prefill_kv_cache = self.module(
+                    input_ids=base_prompt_ids,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    use_cache=True
+                ).past_key_values
 
-                    # Try guidance by forwarding the answer only with current cache
-                    remain = response_length - (input_ids.size(1) - prompt_length)
-                    need = answer_len + 1  # include EOS
-                    if need <= remain:
-                        pos_ans = pos[:, -1:] + torch.arange(1, answer_len + 1, device=pos.device).unsqueeze(0)
-                        ans_am = torch.ones((am.size(0), answer_len), dtype=am.dtype, device=am.device)
-                        out_ans = self.module(
-                            input_ids=answer_tensor,
-                            attention_mask=ans_am,
-                            position_ids=pos_ans,
-                            past_key_values=pkv,
-                            use_cache=True,
-                        )
-                        lp_ans = torch.log_softmax(out_ans.logits.float(), dim=-1)
-                        sel_lp = lp_ans[0].gather(dim=-1, index=answer_tensor[0].unsqueeze(1)).squeeze(1)
-                        avg_log_p = sel_lp.mean()
-                        p_avg = torch.exp(avg_log_p)
-                        if p_avg.item() >= guided_tau:
-                            # Accept guidance: append answer and EOS without extra forward, then terminate
-                            eos_id = eos_list[0]
-                            eos_tok = torch.tensor([[eos_id]], device=input_ids.device, dtype=input_ids.dtype)
-                            pos_eos = pos_ans[:, -1:] + 1
-                            eos_am = torch.ones((am.size(0), 1), dtype=am.dtype, device=am.device)
-                            input_ids = torch.cat([input_ids, answer_tensor, eos_tok], dim=1)
-                            pos = torch.cat([pos, pos_ans, pos_eos], dim=1)
-                            am = torch.cat([am, ans_am, eos_am], dim=1)
-                            print('Answer Guidance Succeeded!!')
-                            break
+                current_completion_ids = torch.zeros((idx.shape[0], 0), dtype=torch.long, device=idx.device)
 
-                    if not do_sample:
-                        next_token = torch.argmax(logits_float, dim=-1, keepdim=True)
-                    else:
-                        l = logits_float
-                        if temperature is not None and temperature != 1.0:
-                            l = l / max(temperature, 1e-8)
-                        if top_k is not None and top_k > 0:
-                            topk_vals, topk_idx = torch.topk(l, k=min(top_k, l.size(-1)), dim=-1)
-                            l_masked = torch.full_like(l, float("-inf"))
-                            l_masked.scatter_(dim=-1, index=topk_idx, src=topk_vals)
-                            l = l_masked
-                        if top_p is not None and 0.0 < top_p < 1.0:
-                            sorted_logits, sorted_idx = torch.sort(l, descending=True, dim=-1)
-                            sorted_probs = torch.softmax(sorted_logits, dim=-1)
-                            cumprobs = torch.cumsum(sorted_probs, dim=-1)
-                            keep = cumprobs <= top_p
-                            keep[..., :1] = True
-                            sorted_logits = torch.where(keep, sorted_logits, torch.full_like(sorted_logits, float("-inf")))
-                            l = torch.full_like(l, float("-inf"))
-                            l.scatter_(dim=-1, index=sorted_idx, src=sorted_logits)
-                        probs = torch.softmax(l, dim=-1)
-                        next_token = torch.multinomial(probs, num_samples=1)
+                for step in range(response_length):
+                    answer_guided_output = self.module(
+                        input_ids = torch.cat([guided_answer_ids], dim=1),
+                        past_key_values = prefill_kv_cache,
+                        use_cache=True
+                    )
 
-                    input_ids = torch.cat((input_ids, next_token), dim=1)
-                    am = torch.cat((am, torch.ones((am.size(0), 1), dtype=am.dtype, device=am.device)), dim=1)
-                    pos = torch.cat((pos, pos[:, -1:] + 1), dim=1)
-
-                    if next_token[0, 0].item() in eos_list:
+                    logits = answer_guided_output.logits
+                    probs = torch.softmax(logits, dim=-1)
+                    answer_probability = 1
+                    for token_idx in range(guided_answer_ids.shape[1]):
+                        answer_probability *= probs[:, token_idx, guided_answer_ids[:, token_idx]]
+                    
+                    if answer_probability >= guided_tau:
+                        seq = torch.cat([base_prompt_ids, current_completion_ids, guided_answer_ids], dim=1)
+                        print("Guided answer accepted with probability:", answer_probability)
+                        # print(seq.shape)
+                        # print(seq)
                         break
-                    # Next step consumes only the newly added token
-                    step_input_ids = next_token
-                
-                seq = input_ids
+                    else:
+                        new_token = torch.multinomial(probs[:, 0, :], num_samples=1)
+                        current_completion_ids = torch.cat([current_completion_ids, new_token], dim=1)
+                        
+                        out = []
+                        for (pk_k, pk_v), (nk_k, nk_v) in zip(prefill_kv_cache, answer_guided_output.past_key_values):
+                            # Concatenate only first token along seq_len axis (dim=2)
+                            out_k = torch.cat([pk_k, nk_k[:, :, 0:1, :]], dim=2)
+                            out_v = torch.cat([pk_v, nk_v[:, :, 0:1, :]], dim=2)
+                            out.append((out_k, out_v))
+                        prefill_kv_cache = DynamicCache.from_legacy_cache(tuple(out))
+                        
+                    if new_token == eos_token_id or step == response_length - 1:
+                        seq = torch.cat([base_prompt_ids, current_completion_ids], dim=1)
+                        print(seq.shape)
+                        print(seq)
             else:
                 output = self.module.generate(
                     input_ids=idx,
