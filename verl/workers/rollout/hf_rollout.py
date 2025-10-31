@@ -132,7 +132,7 @@ class HFRollout(BaseRollout):
                 gai = prompts.non_tensor_batch.get("guided_answer_ids", None)
                 if gai is not None and len(gai) > 0 and prompts.batch.batch_size[0] == 1:
                     guided_answer_ids = gai[0]
-            guided_tau = prompts.meta_info.get("guided_tau", 1e-8)
+            guided_tau = prompts.meta_info.get("guided_tau", 1e-6)
 
             use_guidance = guided_answer_ids is not None
             if use_guidance:
@@ -172,15 +172,47 @@ class HFRollout(BaseRollout):
                         print("Guided answer accepted with probability:", answer_probability)
                         break
                     else:
-                        new_token = torch.argmax(probs[:, 0, :], dim=-1)
-                        current_completion_ids = torch.cat([current_completion_ids, new_token.unsqueeze(0)], dim=1)
+                        # Temperature / top-k sampling (minimal invasive change)
+                        # logits for the next-token position (keep same indexing used previously)
+                        logits_next = answer_guided_output.logits[:, 0, :]  # (batch, vocab)
+
+                        # if temperature is very close to zero, fall back to argmax for stability
+                        if temperature is None:
+                            temp = 1.0
+                        else:
+                            temp = float(temperature)
+                        if temp <= 1e-8:
+                            # deterministic
+                            new_token = torch.argmax(logits_next, dim=-1)  # (batch,)
+                        else:
+                            # scale by temperature
+                            scaled_logits = logits_next / temp  # (batch, vocab)
+
+                            # apply top_k filtering if requested (top_k variable exists in outer scope)
+                            if top_k and int(top_k) > 0:
+                                # keep top_k logits per batch, set others to -inf
+                                topk = int(top_k)
+                                values, indices = torch.topk(scaled_logits, topk, dim=-1)
+                                # create a mask of -inf
+                                mask = torch.full_like(scaled_logits, float("-inf"))
+                                mask.scatter_(1, indices, values)
+                                filtered_logits = mask
+                            else:
+                                filtered_logits = scaled_logits
+
+                            probs_next = torch.softmax(filtered_logits, dim=-1)  # (batch, vocab)
+                            # sample one token per batch
+                            new_token = torch.multinomial(probs_next, num_samples=1).squeeze(-1)  # (batch,)
+
+                        # append the sampled/deterministic token to current_completion_ids
+                        current_completion_ids = torch.cat([current_completion_ids, new_token.unsqueeze(1)], dim=1)
                         
                     if new_token == eos_token_id or step == response_length - 1:
-                        # print("Guided answer rejected with probability:", answer_probability)
+                        print("Guided answer rejected with probability:", answer_probability)
                         seq = torch.cat([base_prompt_ids, current_completion_ids], dim=1)
                         break
-                # print(seq.shape)
-                # print(seq)
+                print(seq.shape)
+                print(seq)
             else:
                 output = self.module.generate(
                     input_ids=idx,
