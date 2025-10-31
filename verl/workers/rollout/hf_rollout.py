@@ -143,17 +143,17 @@ class HFRollout(BaseRollout):
                 print("Guiding:")
                 print(guided_answer_ids)
 
-                base_prompt_ids = idx[:, :prompt_length]
+                base_prompt_ids = idx[:, :-1]
                 outputs = self.module(
                     input_ids=base_prompt_ids,
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
+                    attention_mask=attention_mask[:, :-1],
+                    position_ids=position_ids[:, :-1],
                     use_cache=True
                 )
                 prefill_kv_cache = outputs.past_key_values
-                current_completion_ids = torch.tensor([[torch.argmax(outputs.logits[:, -1], dim=-1)]], dtype=torch.long, device=idx.device)
+                current_completion_ids = torch.tensor(idx[:, prompt_length-1:prompt_length], dtype=torch.long, device=idx.device)
                 
-                for step in range(response_length-1):
+                for step in range(response_length):
                     answer_guided_output = self.module(
                         input_ids = torch.cat([current_completion_ids[:, -1:], guided_answer_ids], dim=1),
                         past_key_values = prefill_kv_cache,
@@ -175,7 +175,7 @@ class HFRollout(BaseRollout):
                         new_token = torch.argmax(probs[:, 0, :], dim=-1)
                         current_completion_ids = torch.cat([current_completion_ids, new_token.unsqueeze(0)], dim=1)
                         
-                    if new_token == eos_token_id or step == response_length - 2:
+                    if new_token == eos_token_id or step == response_length - 1:
                         seq = torch.cat([base_prompt_ids, current_completion_ids], dim=1)
                         print(seq.shape)
                         print(seq)
