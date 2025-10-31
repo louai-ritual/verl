@@ -144,21 +144,22 @@ class HFRollout(BaseRollout):
                 print(guided_answer_ids)
 
                 base_prompt_ids = idx[:, :prompt_length]
-                prefill_kv_cache = self.module(
+                outputs = self.module(
                     input_ids=base_prompt_ids,
                     attention_mask=attention_mask,
                     position_ids=position_ids,
                     use_cache=True
-                ).past_key_values
-
-                current_completion_ids = torch.zeros((idx.shape[0], 0), dtype=torch.long, device=idx.device)
-
-                for step in range(response_length):
+                )
+                prefill_kv_cache = outputs.past_key_values
+                current_completion_ids = torch.tensor([[torch.argmax(outputs.logits[:, -1], dim=-1)]], dtype=torch.long, device=idx.device)
+                
+                for step in range(response_length-1):
                     answer_guided_output = self.module(
-                        input_ids = torch.cat([guided_answer_ids], dim=1),
+                        input_ids = torch.cat([current_completion_ids[:, -1:], guided_answer_ids], dim=1),
                         past_key_values = prefill_kv_cache,
                         use_cache=True
                     )
+                    prefill_kv_cache.crop(max_length=-guided_answer_ids.shape[1])
 
                     logits = answer_guided_output.logits
                     probs = torch.softmax(logits, dim=-1)
@@ -169,25 +170,16 @@ class HFRollout(BaseRollout):
                     if answer_probability >= guided_tau:
                         seq = torch.cat([base_prompt_ids, current_completion_ids, guided_answer_ids], dim=1)
                         print("Guided answer accepted with probability:", answer_probability)
-                        # print(seq.shape)
-                        # print(seq)
                         break
                     else:
-                        new_token = torch.multinomial(probs[:, 0, :], num_samples=1)
-                        current_completion_ids = torch.cat([current_completion_ids, new_token], dim=1)
+                        new_token = torch.argmax(probs[:, 0, :], dim=-1)
+                        current_completion_ids = torch.cat([current_completion_ids, new_token.unsqueeze(0)], dim=1)
                         
-                        out = []
-                        for (pk_k, pk_v), (nk_k, nk_v) in zip(prefill_kv_cache, answer_guided_output.past_key_values):
-                            # Concatenate only first token along seq_len axis (dim=2)
-                            out_k = torch.cat([pk_k, nk_k[:, :, 0:1, :]], dim=2)
-                            out_v = torch.cat([pk_v, nk_v[:, :, 0:1, :]], dim=2)
-                            out.append((out_k, out_v))
-                        prefill_kv_cache = DynamicCache.from_legacy_cache(tuple(out))
-                        
-                    if new_token == eos_token_id or step == response_length - 1:
+                    if new_token == eos_token_id or step == response_length - 2:
                         seq = torch.cat([base_prompt_ids, current_completion_ids], dim=1)
                         print(seq.shape)
                         print(seq)
+                        break
             else:
                 output = self.module.generate(
                     input_ids=idx,
