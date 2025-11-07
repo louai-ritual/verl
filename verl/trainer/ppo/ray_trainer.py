@@ -30,6 +30,7 @@ from typing import Optional
 import numpy as np
 import ray
 import torch
+from tensordict import TensorDict
 from omegaconf import OmegaConf, open_dict
 from torch.utils.data import Dataset, Sampler
 from torchdata.stateful_dataloader import StatefulDataLoader
@@ -1088,6 +1089,60 @@ class RayPPOTrainer:
 
                 # pass global_steps to trace
                 gen_batch.meta_info["global_steps"] = self.global_steps
+                if "reward_model" in batch.non_tensor_batch:
+                    gen_batch.non_tensor_batch["reward_model"] = batch.non_tensor_batch["reward_model"]
+                    try:
+                        import json
+
+                        rm_arr = gen_batch.non_tensor_batch["reward_model"]
+                        guided_ids = []
+                        for i in range(len(rm_arr)):
+                            rm_entry = rm_arr[i]
+                            gt = None
+                            if isinstance(rm_entry, dict):
+                                gt = rm_entry.get("ground_truth", None)
+                            elif isinstance(rm_entry, str):
+                                try:
+                                    obj = json.loads(rm_entry)
+                                    if isinstance(obj, dict):
+                                        gt = obj.get("ground_truth", None)
+                                except Exception:
+                                    gt = None
+                            elif hasattr(rm_entry, "item"):
+                                try:
+                                    obj = rm_entry.item()
+                                    if isinstance(obj, dict):
+                                        gt = obj.get("ground_truth", None)
+                                except Exception:
+                                    gt = None
+
+                            if gt is not None and not isinstance(gt, str):
+                                gt = str(gt)
+                            if isinstance(gt, str) and len(gt) > 0:
+                                guided_ids.append(self.tokenizer.encode(f"#### {gt}", add_special_tokens=False))
+                            else:
+                                guided_ids.append(None)
+                        gen_batch.non_tensor_batch["guided_answer_ids"] = np.array(guided_ids, dtype=object)
+                        # If single-sample, also set into meta_info for robust access in HF rollout
+                        if len(gen_batch) == 1 and guided_ids[0] is not None:
+                            gen_batch.meta_info["guided_answer_ids"] = guided_ids[0]
+                        # Also add a padded tensor variant into batch for robust transport
+                        max_len = max((len(x) for x in guided_ids if x is not None), default=0)
+                        if max_len > 0:
+                            pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
+                            padded = torch.full((len(guided_ids), max_len), pad_id, dtype=torch.long)
+                            lens = torch.zeros(len(guided_ids), dtype=torch.long)
+                            for i, ids in enumerate(guided_ids):
+                                if ids is not None and len(ids) > 0:
+                                    l = len(ids)
+                                    padded[i, :l] = torch.tensor(ids, dtype=torch.long)
+                                    lens[i] = l
+                            if gen_batch.batch is None:
+                                gen_batch.batch = TensorDict({}, batch_size=(len(guided_ids),))
+                            gen_batch.batch["guided_answer_ids_padded"] = padded
+                            gen_batch.batch["guided_answer_lens"] = lens
+                    except Exception:
+                        pass
                 gen_batch_output = gen_batch.repeat(
                     repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
                 )

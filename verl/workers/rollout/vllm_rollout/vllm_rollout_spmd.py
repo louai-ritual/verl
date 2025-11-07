@@ -33,6 +33,8 @@ import logging
 import os
 import pickle
 import time
+import math
+import random
 from contextlib import contextmanager
 from dataclasses import asdict
 from types import MethodType
@@ -235,6 +237,7 @@ class vLLMRollout(BaseRollout):
             enable_prefix_caching=config.enable_prefix_caching,
             trust_remote_code=trust_remote_code,
             seed=config.get("seed", 0),
+            max_logprobs=50,
             **compilation_config,
             **self.lora_kwargs,
             **engine_kwargs,
@@ -309,6 +312,23 @@ class vLLMRollout(BaseRollout):
         batch_size = idx.size(0)
 
         non_tensor_batch = prompts.non_tensor_batch
+        # Retrieve guided answer ids (if provided)
+        guided_answer_ids = None
+        if "guided_answer_ids" in prompts.meta_info:
+            guided_answer_ids = prompts.meta_info["guided_answer_ids"]
+        elif "guided_answer_ids" in non_tensor_batch:
+            # Expect numpy object array with length 1
+            gai = non_tensor_batch["guided_answer_ids"]
+            if isinstance(gai, np.ndarray) and len(gai) > 0:
+                guided_answer_ids = gai[0]
+
+        # Ensure list[int]
+        if guided_answer_ids is not None and not isinstance(guided_answer_ids, (list, np.ndarray)):
+            guided_answer_ids = None
+        if isinstance(guided_answer_ids, np.ndarray):
+            guided_answer_ids = guided_answer_ids.tolist()
+
+        breakpoint()
         if "raw_prompt_ids" not in non_tensor_batch:
             non_tensor_batch["raw_prompt_ids"] = np.array(
                 [_pre_process_inputs(self.pad_token_id, idx[i]) for i in range(batch_size)], dtype=object
@@ -356,6 +376,12 @@ class vLLMRollout(BaseRollout):
                 "temperature": self.config.val_kwargs.temperature,
                 "n": 1,  # if validate, already repeat in ray_trainer
             }
+        else:
+            kwargs = {
+                "max_tokens": 1,
+                "prompt_logprobs": 50,
+                "n": 1,
+            }
 
         lora_requests = None
         if self.lora_kwargs:
@@ -367,28 +393,75 @@ class vLLMRollout(BaseRollout):
                 ] * batch_size
 
         # users can customize different sampling_params at different run
+        guided_tau = -8.0
         with self.update_sampling_params(**kwargs):
-            outputs = self.inference_engine.generate(
-                prompts=vllm_inputs,  # because we have already convert it to prompt token id
-                sampling_params=self.sampling_params,
-                lora_request=lora_requests,
-                use_tqdm=False,
-            )
-
-            # TODO(sgm): disable logprob when recompute_log_prob is enable
-            # if n = 1: (bs, response_length) ; if n > 1: (bs * n, response_length)
-
+            base_prompt = vllm_inputs[0]["prompt_token_ids"]
             response = []
             rollout_log_probs = []
-            for output in outputs:
-                for sample_id in range(len(output.outputs)):
-                    response_ids = output.outputs[sample_id].token_ids
-                    response.append(response_ids)
-                    if self.config.calculate_log_probs:
-                        curr_log_prob = []
-                        for i, logprob in enumerate(output.outputs[sample_id].logprobs):
-                            curr_log_prob.append(logprob[response_ids[i]].logprob)
-                        rollout_log_probs.append(curr_log_prob)
+
+            use_guidance = guided_answer_ids is not None
+            if use_guidance:
+                for _ in range(self.config.n):
+                    current_response = []
+                    for i in range(self.config.response_length):
+                        guided_vllm_inputs = [{"prompt_token_ids": base_prompt + current_response + guided_answer_ids}]
+                        outputs = self.inference_engine.generate(
+                            prompts=guided_vllm_inputs,  # because we have already convert it to prompt token id
+                            sampling_params=self.sampling_params,
+                            lora_request=lora_requests,
+                            use_tqdm=False,
+                        ) 
+
+                        answer_logprob = 0
+                        for j in range(1, len(guided_answer_ids) + 1):
+                            answer_logprob += next(iter(outputs[0].prompt_logprobs[-j].values())).logprob
+                        if answer_logprob > guided_tau:
+                            print(f"Answer guidance succeeded with probability {math.exp(answer_logprob)}")
+                            current_response.extend(guided_answer_ids)
+                            break
+                        
+                        def _sample_from_logprobs(logprobs_dict):
+                            # Extract token ids and their (already temperature-scaled) logprobs
+                            token_ids = list(logprobs_dict.keys())
+                            logprob_values = [logprobs_dict[token_id].logprob for token_id in token_ids]
+
+                            # Convert to probabilities (softmax in log-space for numerical stability)
+                            max_logprob = max(logprob_values)
+                            probs = [math.exp(lp - max_logprob) for lp in logprob_values]
+                            total = sum(probs)
+                            probs = [p / total for p in probs]
+
+                            # Sample one token according to the probabilities
+                            sampled_token_id = random.choices(token_ids, weights=probs, k=1)[0]
+                            sampled_token = logprobs_dict[sampled_token_id].decoded_token
+                            return sampled_token_id
+
+                        current_response.append(_sample_from_logprobs(outputs[0].prompt_logprobs[-len(guided_answer_ids)]))
+                        if current_response[-1] in eos_token_id:
+                            break
+
+                    print(current_response)
+                    response.append(current_response)
+
+            else:
+                # breakpoint()
+                outputs = self.inference_engine.generate(
+                        prompts=vllm_inputs,  # because we have already convert it to prompt token id
+                        sampling_params=self.sampling_params,
+                        lora_request=lora_requests,
+                        use_tqdm=False,
+                    ) 
+                # TODO(sgm): disable logprob when recompute_log_prob is enable
+                # if n = 1: (bs, response_length) ; if n > 1: (bs * n, response_length)
+                for output in outputs:
+                    for sample_id in range(len(output.outputs)):
+                        response_ids = output.outputs[sample_id].token_ids
+                        response.append(response_ids)
+                        if self.config.calculate_log_probs:
+                            curr_log_prob = []
+                            for i, logprob in enumerate(output.outputs[sample_id].logprobs):
+                                curr_log_prob.append(logprob[response_ids[i]].logprob)
+                            rollout_log_probs.append(curr_log_prob)
 
             response = pad_2d_list_to_length(response, self.pad_token_id, max_length=self.config.response_length).to(
                 idx.device
