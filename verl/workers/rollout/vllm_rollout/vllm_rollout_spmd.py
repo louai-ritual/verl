@@ -354,8 +354,12 @@ class vLLMRollout(BaseRollout):
 
         do_sample = prompts.meta_info.get("do_sample", True)
         is_validate = prompts.meta_info.get("validate", False)
+        use_guidance = guided_answer_ids is not None
+        # use_guidance = False
+
         if not do_sample:
             kwargs = {
+                "max_tokens": self.config.response_length,
                 "best_of": 1,
                 "top_p": 1.0,
                 "top_k": -1,
@@ -366,16 +370,21 @@ class vLLMRollout(BaseRollout):
         elif is_validate:
             # TODO: try **
             kwargs = {
+                "max_tokens": self.config.response_length,
                 "top_k": self.config.val_kwargs.top_k,
                 "top_p": self.config.val_kwargs.top_p,
                 "temperature": self.config.val_kwargs.temperature,
                 "n": 1,  # if validate, already repeat in ray_trainer
             }
-        else:
+        elif use_guidance:
             kwargs = {
                 "max_tokens": 1,
                 "prompt_logprobs": 50,
                 "n": 1,
+            }
+        else:
+            kwargs = {
+                "max_tokens": self.config.response_length,
             }
 
         lora_requests = None
@@ -388,12 +397,11 @@ class vLLMRollout(BaseRollout):
                 ] * batch_size
 
         # users can customize different sampling_params at different run
-        guided_tau = -8.0
+        guided_tau = -5.0
         with self.update_sampling_params(**kwargs):
             response = []
             rollout_log_probs = []
 
-            use_guidance = guided_answer_ids is not None
             if use_guidance:
                 response = [[] for _ in range(batch_size)]
                 # Track which sequences are finished (EOS or guidance success)
@@ -505,6 +513,8 @@ class vLLMRollout(BaseRollout):
                             for i, logprob in enumerate(output.outputs[sample_id].logprobs):
                                 curr_log_prob.append(logprob[response_ids[i]].logprob)
                             rollout_log_probs.append(curr_log_prob)
+
+            print(response, flush=True)
 
             response = pad_2d_list_to_length(response, self.pad_token_id, max_length=self.config.response_length).to(
                 idx.device
