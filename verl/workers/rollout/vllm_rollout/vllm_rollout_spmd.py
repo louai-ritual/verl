@@ -355,6 +355,7 @@ class vLLMRollout(BaseRollout):
         do_sample = prompts.meta_info.get("do_sample", True)
         is_validate = prompts.meta_info.get("validate", False)
         use_guidance = guided_answer_ids is not None
+        STEP_SIZE = 128
         # use_guidance = False
 
         if not do_sample:
@@ -378,7 +379,7 @@ class vLLMRollout(BaseRollout):
             }
         elif use_guidance:
             kwargs = {
-                "max_tokens": 1,
+                "max_tokens": STEP_SIZE,
                 "prompt_logprobs": 50,
                 "n": 1,
             }
@@ -431,13 +432,14 @@ class vLLMRollout(BaseRollout):
                     sampled_token = logprobs_dict[sampled_token_id].decoded_token
                     return sampled_token_id
                 
-                for i in range(self.config.response_length):
+                for i in range(0, self.config.response_length, STEP_SIZE):
                     # Check if all sequences are finished
                     if all(finished_mask):
                         break
                     
                     # Build guided_vllm_inputs with current accumulated responses
                     # Only include sequences that are not finished
+                    active_unguided_inputs = []
                     active_guided_inputs = []
                     active_indices = []  # Track original batch indices for active sequences
                     
@@ -445,8 +447,10 @@ class vLLMRollout(BaseRollout):
                         if not finished_mask[k]:
                             # Construct input with prompt + current_response + guided_answer_ids
                             prompt_ids = vllm_inputs[k]["prompt_token_ids"]
-                            full_input_ids = prompt_ids + current_response[k] + guided_answer_ids[k]
-                            active_guided_inputs.append({"prompt_token_ids": full_input_ids})
+                            unguided_input_ids = prompt_ids + current_response[k]
+                            guided_input_ids = prompt_ids + current_response[k] + guided_answer_ids[k]
+                            active_unguided_inputs.append({"prompt_token_ids": unguided_input_ids})
+                            active_guided_inputs.append({"prompt_token_ids": guided_input_ids})
                             active_indices.append(k)
                     
                     # Skip vLLM call if no active sequences
@@ -459,20 +463,29 @@ class vLLMRollout(BaseRollout):
                         active_lora_requests = [lora_requests[idx] for idx in active_indices]
                     
                     # Generate tokens for active sequences
-                    outputs = self.inference_engine.generate(
-                        prompts=active_guided_inputs,
+                    self.sampling_params.max_tokens = STEP_SIZE
+                    unguided_outputs = self.inference_engine.generate(
+                        prompts=active_unguided_inputs,
                         sampling_params=self.sampling_params,
                         lora_request=active_lora_requests,
                         use_tqdm=False,
                     )
                     
+                    self.sampling_params.max_tokens = 1
+                    guided_outputs = self.inference_engine.generate(
+                        prompts=active_guided_inputs,
+                        sampling_params=self.sampling_params,
+                        lora_request=active_lora_requests,
+                        use_tqdm=False,
+                    )
+
                     # Process outputs - outputs are in the same order as active_guided_inputs
                     for output_idx, k in enumerate(active_indices):
                         # Check if guidance succeeded by computing logprob of guided answer tokens
                         answer_logprob = 0
                         try:
                             for j in range(1, len(guided_answer_ids[k]) + 1):
-                                answer_logprob += next(iter(outputs[output_idx].prompt_logprobs[-j].values())).logprob
+                                answer_logprob += next(iter(guided_outputs[output_idx].prompt_logprobs[-j].values())).logprob
                             
                             if answer_logprob > guided_tau:
                                 print(f"Sequence {k}: Answer guidance succeeded with probability {math.exp(answer_logprob)}")
@@ -484,16 +497,14 @@ class vLLMRollout(BaseRollout):
                             pass
                         
                         # Sample token from logprobs
-                        sampled_token_id = _sample_from_logprobs(
-                            outputs[output_idx].prompt_logprobs[-len(guided_answer_ids[k])]
-                        )
+                        sampled_token_ids = unguided_outputs[output_idx].outputs[0].token_ids
                         
-                        if sampled_token_id is not None:
-                            response[k].append(sampled_token_id)
-                            current_response[k].append(sampled_token_id)
+                        if sampled_token_ids is not None:
+                            response[k].extend(sampled_token_ids)
+                            current_response[k].extend(sampled_token_ids)
                             
                             # Check for EOS token
-                            if sampled_token_id in eos_token_set:
+                            if sampled_token_ids[-1] in eos_token_set:
                                 finished_mask[k] = True
             else:
                 outputs = self.inference_engine.generate(
